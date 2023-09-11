@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  sam-api
+
+  Sample SAM Template for sam-api
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 3
+    MemorySize: 128
+Parameters:
+  APIName:
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    Default: UserApi
+    Type: String
+  
+  ProjectName:
+    Type: String
+    Default: aws-appsync-user
+Resources:
+  ## Se crea la lambda function llamada user api
+  UserApi:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: user/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Architectures:
+        - x86_64
+      # Policies:
+      # - Version: '2012-10-17'
+      #   Statement:
+      #     - Effect: Allow
+      #       Action:
+      #         - 'dynamodb:PutItem'
+      #         - 'dynamodb:GetItem'
+      #         - 'dynamodb:Scan'
+      #         - 'dynamodb:Query'
+      #         - 'dynamodb:DeleteItem'
+      #         - 'dynamodb:UpdateItem'
+      #       Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/User"
+      
+      ## se crean los eventos para el lambda y endpoints para api gateway
+      Events:
+        Users:
+          Type: Api 
+          Properties:
+            Path: /users
+            Method: get
+        PostUser:
+          Type: Api
+          Properties:
+            Path: /users/new
+            Method: post
+        GetUser:
+          Type: Api
+          Properties:
+            Path: /users/{id}
+            Method: get
+        PutUser:
+          Type: Api
+          Properties:
+            Path: /users/{id}
+            Method: put
+        DeleteUser:
+          Type: Api
+          Properties:
+            Path: /users/{id}
+            Method: delete 
+  
+## creacion de autenticacion por cognito
+  UserManagerUserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: !Sub ${APIName}-user-pool
+        AutoVerifiedAttributes:
+          - email
+        MfaConfiguration: "OFF"
+        Schema:
+          - Name: name
+            AttributeDataType: String
+            Mutable: true
+            Required: true
+          - Name: email
+            AttributeDataType: String
+            Mutable: true
+            Required: true
+
+  UserManagerEditorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      Description: User Manager editors
+      GroupName: Editors
+      UserPoolId: !Ref UserManagerUserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${APIName}-appsync-client
+      GenerateSecret: false
+      UserPoolId: !Ref UserManagerUserPool
+
+
+  ## se crea la tabla en dynamo
+  UserTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Users
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+  
+  ## se crea la appsync de user
+  AppSyncUser:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      Name: UserGraphQLApi
+  
+  UserDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncUser.ApiId
+      Name: !Sub ${APIName}_user_schedule_table
+      Description: AppSync data source user schedule table
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref UserTable
+        AwsRegion: !Sub ${AWS::Region}
+  ##se crea el query schema
+  QuerySchema:
+    Type: AWS::AppSync::GraphQLSchema
+    DependsOn: AppSyncUser
+    Properties:
+      ApiId: !GetAtt AppSyncUser.ApiId
+      Definition: |
+        type User {
+            userID: ID!
+            name: String!
+            lastname: String!
+            email: String!
+          }
+        type Query {
+          getUserById(userId: ID!): User
+        }
+
+  ## se crea el resolver    
+  UserResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: UserDataSource
+    Properties:
+      ApiId: !GetAtt AppSyncUser.ApiId
+      FieldName: getUserById
+      TypeName: Query
+      DataSourceName: UsersDataSource
+      RequestMappingTemplate: |
+        {
+          "version": "2023-09-09",
+          "operation": "GetItem",
+          "key": {
+            "userId": $util.dynamodb.toDynamoDBJson($ctx.args.userId)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result.Item ? $ctx.result.Item : {})
+  
+   #### IAM
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /user-manager/
+      RoleName: !Sub ${APIName}-appsync-service-role
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+  AppSyncDDBPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: appsync-user-manager-ddb-policy
+      Roles:
+        - !Ref AppSyncServiceRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:DeleteItem
+              - dynamodb:UpdateItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource:
+              - !Join [ "", [ !GetAtt UserTable.Arn, "*" ] ]
+
+Outputs:
+  UserApi:
+    Description: "API Gateway endpoint URL for Prod stage for User function"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/users/"
+  KeyUser:
+    Description: "Key de usuario para realizar consultas graphQL"
+    Value: !GetAtt AppSyncUser.ApiId
